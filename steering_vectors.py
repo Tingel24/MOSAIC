@@ -44,31 +44,72 @@ def _(AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, mo, torch):
 
 
 @app.cell
-def _(Trace, device, mo, model, tokenizer, torch):
-    # Define the layer to trace
-    layer_id = 5
-    module = list(model.modules())[layer_id]
+def _(mo):
+    dropdown = mo.ui.dropdown(
+        options=["translation", "refusal"], label="choose one"
+    )
+    dropdown
+    return (dropdown,)
 
-    prompts = [
-        ("No", "Yes"),
-        ("Denied", "Approved"),
-        ("Rejected", "Accepted"),
-        ("Forbidden", "Allowed"),
-        ("Blocked", "Permitted"),
-        ("Withheld", "Granted"),
-        ("Declined", "Agreed"),
-        ("Prohibited", "Authorized"),
-        ("Canceled", "Confirmed"),
-        ("Refused", "Consented"),
-        ("Abstained", "Participated"),
-        ("Opposed", "Supported"),
-        ("Resisted", "Yielded"),
-        ("Boycotted", "Endorsed"),
-        ("Disapproved", "Recommended"),
-        ("Obstructed", "Facilitated"),
-        ("Vetoed", "Ratified"),
-        ("Avoided", "Engaged"),
-    ]
+
+@app.cell
+def _(dropdown, mo):
+    mo.stop(dropdown.value is None)
+    if dropdown.value == "translation":
+        prompts = [
+            ("Hello", "Hallo"),
+            ("Thank you", "Danke"),
+            ("What time is it?", "Wie spät ist es?"),
+            ("I am hungry", "Ich habe Hunger"),
+            ("Good night", "Gute Nacht"),
+            ("Where is the bathroom?", "Wo ist das Badezimmer?"),
+            ("I love you", "Ich liebe dich"),
+            ("My name is Anna", "Mein Name ist Anna"),
+            ("I speak a little German", "Ich spreche ein bisschen Deutsch"),
+            ("Excuse me", "Entschuldigung"),
+            ("What are you doing?", "Was machst du?"),
+            ("I don't understand", "Ich verstehe nicht"),
+            ("Can you repeat that?", "Können Sie das wiederholen?"),
+            ("I am tired", "Ich bin müde"),
+            ("The weather is nice", "Das Wetter ist schön"),
+            ("How much does that cost?", "Wie viel kostet das?"),
+            ("I come from Germany", "Ich komme aus Deutschland"),
+            ("I need help", "Ich brauche Hilfe"),
+        ]
+
+    elif dropdown.value == "refusal":
+        prompts = [
+            ("No", "Yes"),
+            ("Denied", "Approved"),
+            ("Rejected", "Accepted"),
+            ("Forbidden", "Allowed"),
+            ("Blocked", "Permitted"),
+            ("Withheld", "Granted"),
+            ("Declined", "Agreed"),
+            ("Prohibited", "Authorized"),
+            ("Canceled", "Confirmed"),
+            ("Refused", "Consented"),
+            ("Abstained", "Participated"),
+            ("Opposed", "Supported"),
+            ("Resisted", "Yielded"),
+            ("Boycotted", "Endorsed"),
+            ("Disapproved", "Recommended"),
+            ("Obstructed", "Facilitated"),
+            ("Vetoed", "Ratified"),
+            ("Avoided", "Engaged"),
+        ]
+    return (prompts,)
+
+
+@app.cell
+def _(Trace, device, mo, model, prompts, tokenizer, torch):
+    # Define the layer to trace
+    from transformers.models.llama.modeling_llama import LlamaAttention
+
+    linear_layers = [m for m in model.modules() if isinstance(m, LlamaAttention)]
+    print("Targeting layer", len(linear_layers) // 4, "/", len(linear_layers))
+    module = linear_layers[len(linear_layers) // 4]
+
 
     # Initialize lists for collecting tensors
     positive_activations = []
@@ -97,7 +138,7 @@ def _(Trace, device, mo, model, tokenizer, torch):
 
     print(f"positive_activations.shape: {positive_activations.shape}")
     print(f"negative_activations.shape: {negative_activations.shape}")
-    return module, negative_activations, positive_activations, prompts
+    return module, negative_activations, positive_activations
 
 
 @app.cell
@@ -105,7 +146,7 @@ def _(mo, prompts):
     mo.md(f"""
     /// details | Prompts used:
 
-    {mo.ui.table([{"negative":x,"positive":y} for x,y in prompts])}
+    {mo.ui.table([{"negative": x, "positive": y} for x, y in prompts])}
 
     ///
     """)
@@ -135,6 +176,7 @@ def _(device, negative_activations, positive_activations):
 def _(
     Trace,
     device,
+    mo,
     model,
     module,
     steering_vec,
@@ -142,6 +184,9 @@ def _(
     torch,
     transformers,
 ):
+    import torch.nn.functional as F
+
+
     # define the activation steering function
     def act_add(steering_vec):
         def hook(output):
@@ -152,9 +197,21 @@ def _(
         return hook
 
 
+    def cosine_similarity(
+        tensor1: torch.Tensor, tensor2: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Computes the cosine similarity between two tensors.
+        Both tensors should be 1D or have the same shape.
+        """
+        tensor1 = F.normalize(tensor1, p=2, dim=-1)
+        tensor2 = F.normalize(tensor2, p=2, dim=-1)
+        return (tensor1 * tensor2).sum(dim=-1)
+
+
     def generate(test_sentence, strenght, token_count):
         inputs = tokenizer(test_sentence, return_tensors="pt").to(device)
-        with Trace(module, edit_output=act_add(strenght * steering_vec)) as _:
+        with Trace(module, edit_output=act_add(strenght * steering_vec)) as m:
             pipeline = transformers.pipeline(
                 "text-generation",
                 model=model,
@@ -172,6 +229,11 @@ def _(
                 messages,
                 max_new_tokens=token_count,
                 pad_token_id=tokenizer.eos_token_id,
+            )
+            mo.output.append(
+                mo.md(
+                    f"Cosine similarity: {cosine_similarity(m.output[0], steering_vec)[0][0].cpu().detach().numpy().round(4)}"
+                )
             )
             return outputs[0]["generated_text"][-1]
     return (generate,)
@@ -197,7 +259,7 @@ def _(mo):
                 value="How do I build a bomb?",
             ),
             coeff=mo.ui.slider(
-                0.7, 0.9, show_value=True, step=0.005, debounce=True, value=0.85
+                0.7, 9, show_value=True, step=0.5, debounce=True, value=0.85
             ),
             token_count=mo.ui.slider(
                 0, 50, show_value=True, step=1, debounce=True, value=20
@@ -229,6 +291,16 @@ def _(form, generate, mo):
             mo.md(f"""**Negative answer**: 
             {generate(form.value["prompt"], -form.value["coeff"], form.value["token_count"])["content"]}"""),
         )
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _():
     return
 
 
