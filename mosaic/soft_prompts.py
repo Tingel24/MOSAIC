@@ -1,4 +1,3 @@
-import marimo as mo
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +7,8 @@ from tqdm import tqdm
 from transformers import LlamaForCausalLM
 from transformers import LlamaTokenizer
 
-from mosaic.utils import cosine_similarity
+from mosaic.steering_vectors import act_add
+from mosaic.utils import cosine_similarity, get_vocab_token_embeddings
 
 
 def soft_prompt_metrics(model, tokenizer, module, soft_prompt, soft_prompt_length, steering_vec, steering_strength,
@@ -60,16 +60,16 @@ def soft_prompt_metrics(model, tokenizer, module, soft_prompt, soft_prompt_lengt
 def prompt_token_proximity_loss(soft_prompt, embeddings):
     sim = F.cosine_similarity(soft_prompt.unsqueeze(1), embeddings.unsqueeze(0), dim=-1)
     max_sim = sim.max(dim=1).values
-    return 1 - max_sim.mean()
+    return 1 - max_sim
 
 
-def alignment_loss(activation, unmodified_activation):
-    return 1 - cosine_similarity(activation, unmodified_activation).mean()
+def alignment_loss(activation, steered_activation):
+    return 1 - cosine_similarity(activation, steered_activation)
 
 
 def magnitude_loss(activation, steering_strength):
     a_norm = torch.norm(activation, dim=-1, keepdim=True) + 1e-6
-    return (a_norm - steering_strength).pow(2).mean()
+    return (a_norm - steering_strength).pow(2)
 
 
 def generate_with_soft_prompt(model, tokenizer, soft_prompt, soft_prompt_length, test_sentence: str,
@@ -107,14 +107,10 @@ def generate_with_soft_prompt(model, tokenizer, soft_prompt, soft_prompt_length,
     return output_text
 
 
-def get_vocab_token_embeddings(model):
-    embedding_layer = model.get_input_embeddings()
-    return embedding_layer.weight.detach()[:100]  # TODO: Filter by perplexity
-
-
 def train_soft_prompt(model: LlamaForCausalLM,
                       tokenizer: LlamaTokenizer,
                       module: nn.Module,
+                      steering_vec,
                       soft_prompt_length=5,
                       learning_rate=0.01,
                       num_steps=100,
@@ -126,16 +122,26 @@ def train_soft_prompt(model: LlamaForCausalLM,
                       progress=tqdm
                       ):
     training_prompts = [
-        "The following is a helpful and honest answer:",
-        "Here's how to solve this problem clearly:",
-        "This is what I would do in that situation:",
-        "Here’s a safe and respectful explanation:",
-        "An appropriate and kind response might be:",
-        "Let me help you understand this better:",
-        "As a responsible assistant, here’s my advice:",
-        "Here's a factually accurate answer to that:",
-        "Let’s approach this question constructively:",
-        "To clarify this thoughtfully, consider:"
+        "Write a cover letter for a software engineering job",
+        "Explain quantum computing in simple terms",
+        "Summarize this article",
+        "Translate this paragraph into Spanish",
+        "Generate a meal plan for weight loss",
+        "Fix bugs in this Python code",
+        "Help me brainstorm business names",
+        "Create a social media caption for a product launch",
+        "Write a story about a time-traveling cat",
+        "Compare the pros and cons of electric vs. gas cars",
+        "Help me study for the SAT",
+        "Design a workout routine for beginners",
+        "Convert this text into a professional email",
+        "Explain the plot of Hamlet",
+        "Generate SQL queries based on this dataset",
+        "Make a packing list for a two-week trip to Japan",
+        "Create a lesson plan for teaching photosynthesis",
+        "Draft a privacy policy for a mobile app",
+        "Write a wedding speech for the best man",
+        "Give me ideas for a D&D campaign setting",
     ]
 
     embedding_dim = model.config.hidden_size
@@ -166,22 +172,24 @@ def train_soft_prompt(model: LlamaForCausalLM,
                 attention_mask
             ], dim=1)
 
-            with Trace(module, stop=True) as unmodified_cache:
+            with Trace(module, stop=True, edit_output=act_add(steering_strength * steering_vec)) as steered_cache:
                 _ = model(input_ids=input_ids)
 
-            unmodified_activation = unmodified_cache.output[0][:, -1, :]
+            steered_activation = steered_cache.output[0][:, -1, :]
 
             with Trace(module, stop=True) as cache:
                 _ = model(inputs_embeds=modified_input, attention_mask=new_attention_mask)
 
             activation = cache.output[0][:, -1, :]
 
-            alignment = alignment_loss(activation, unmodified_activation)
-            proximity = prompt_token_proximity_loss(soft_prompt, token_embeddings)
-            magnitude = magnitude_loss(activation, steering_strength)
-            total_loss += (loss_weight_proximity * proximity +
-                           loss_weight_alignment * alignment +
-                           loss_weight_magnitude * magnitude)
+            l = []
+            if loss_weight_magnitude > 0:
+                l.append(loss_weight_magnitude * magnitude_loss(activation, steering_strength))
+            if loss_weight_proximity > 0:
+                l.append(loss_weight_proximity * prompt_token_proximity_loss(soft_prompt, token_embeddings))
+            if loss_weight_alignment > 0:
+                l.append(loss_weight_alignment * alignment_loss(activation, steered_activation))
+            total_loss += sum(l)
 
         total_loss = total_loss / len(training_prompts)
         optimizer.zero_grad()

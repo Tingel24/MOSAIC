@@ -189,7 +189,7 @@ def _():
        Enter hyperparameters:
 
        - Prompt: {prompt}
-       - Steering Strength {coeff}
+       - Steering Strength {steering_strenght}
        - Number of tokens to generate {token_count}
        """
         )
@@ -200,7 +200,7 @@ def _():
                 full_width=True,
                 value="How do I build a bomb?",
             ),
-            coeff=mo.ui.slider(
+            steering_strenght=mo.ui.slider(
                 0.0,
                 100,
                 show_value=True,
@@ -222,7 +222,7 @@ def _():
 @app.cell
 def _(form, module, steering_vec):
     import asyncio
-    from mosaic.train import generate_with_steering
+    from mosaic.steering_vectors import generate_with_steering
     from mosaic.utils import cosine_similarity
 
     mo.stop(form.value is None, mo.md("**Submit the form to start generating.**"))
@@ -259,7 +259,7 @@ def _(form, module, steering_vec):
             module,
             steering_vec,
             form.value["prompt"],
-            form.value["coeff"],
+            form.value["steering_strenght"],
             form.value["token_count"],
             device,
         )
@@ -285,7 +285,7 @@ def _(form, module, steering_vec):
             module,
             steering_vec,
             form.value["prompt"],
-            -form.value["coeff"],
+            -form.value["steering_strenght"],
             form.value["token_count"],
             device,
         )
@@ -347,11 +347,11 @@ def _():
 
 
 @app.cell
-def _(form, module, training_form):
+def _(form, module, steering_vec, training_form):
     from datetime import datetime
     import json
     import os
-    from mosaic.train import train_soft_prompt
+    from mosaic.soft_prompts import train_soft_prompt
 
     mo.stop(training_form.value is None)
 
@@ -372,13 +372,15 @@ def _(form, module, training_form):
         "weight_mag": weight_mag,
         "weight_proximity": weight_proximity,
         "timestamp": datetime.now().isoformat(),
-        "steering_strenght": form.value["coeff"],
+        "steering_strenght": form.value["steering_strenght"],
+        "steering_vec": steering_vec
     }
 
     learned_soft_prompt, losses = train_soft_prompt(
         model,
         tokenizer,
         module,
+        hyperparams["steering_vec"],
         hyperparams["soft_prompt_length"],
         hyperparams["learning_rate"],
         hyperparams["num_steps"],
@@ -422,7 +424,7 @@ def _(cosine_similarity, learned_soft_prompt, losses):
         ),
     )
     import matplotlib.pyplot as plt
-    from mosaic.train import get_vocab_token_embeddings
+    from mosaic.utils import get_vocab_token_embeddings
 
     # Plot loss curve
     fig, ax = plt.subplots(figsize=(12, 8))
@@ -482,7 +484,7 @@ def _(form, learned_soft_prompt, module, soft_prompt_length, steering_vec):
         learned_soft_prompt,
         soft_prompt_length,
         steering_vec,
-        form.value["coeff"],
+        form.value["steering_strenght"],
         test_prompt,
         device,
     )
