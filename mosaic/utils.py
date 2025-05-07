@@ -1,7 +1,6 @@
 import torch.nn.functional as F
 import torch
 
-
 def cosine_similarity(
         tensor1: torch.Tensor, tensor2: torch.Tensor
 ) -> torch.Tensor:
