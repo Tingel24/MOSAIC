@@ -202,7 +202,9 @@ def _(negative_activations, positive_activations):
     steering_vec = steering_vecs.mean(dim=0)  # shape: (D,)
 
     print(f"steering_vec.shape:  {steering_vec.shape}")
-    print(f"length steering_vec: {steering_vec.norm():.2f} (will be normalized to 1 now)")
+    print(
+        f"length steering_vec: {steering_vec.norm():.2f} (will be normalized to 1 now)"
+    )
 
     # Normalize to unit length
     steering_vec = steering_vec / steering_vec.norm()
@@ -210,63 +212,6 @@ def _(negative_activations, positive_activations):
     # Move to device (e.g., CUDA)
     steering_vec = steering_vec.to(device)
     return (steering_vec,)
-
-
-@app.cell
-def _(module, steering_vec):
-    import torch.nn.functional as F
-
-
-    # define the activation steering function
-    def act_add(steering_vec):
-        def hook(output):
-            return (
-                (output[0] + steering_vec,) + output[1:]
-            )  # the output of the residual stream is actually a tuple, where the first entry is the activation
-
-        return hook
-
-
-    def cosine_similarity(
-        tensor1: torch.Tensor, tensor2: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Computes the cosine similarity between two tensors.
-        Both tensors should be 1D or have the same shape.
-        """
-        tensor1 = F.normalize(tensor1, p=2, dim=-1)
-        tensor2 = F.normalize(tensor2, p=2, dim=-1)
-        return (tensor1 * tensor2).sum(dim=-1)
-
-
-    def generate(test_sentence, strenght, token_count):
-        inputs = tokenizer(test_sentence, return_tensors="pt").to(device)
-        with Trace(module, edit_output=act_add(strenght * steering_vec)) as m:
-            pipeline = transformers.pipeline(
-                "text-generation",
-                model=model,
-                model_kwargs={"torch_dtype": torch.bfloat16},
-                device=device,
-                tokenizer=tokenizer,
-            )
-
-            messages = [
-                {"role": "system", "content": "You are a chatbot"},
-                {"role": "user", "content": test_sentence},
-            ]
-
-            outputs = pipeline(
-                messages,
-                max_new_tokens=token_count,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            mo.output.append(
-                mo.md(
-                    f"Cosine similarity: {'{:0.3f}'.format(cosine_similarity(m.output[0], steering_vec)[0][0].cpu().detach().numpy())}"
-                )
-            )
-            return outputs[0]["generated_text"][-1]
-    return F, cosine_similarity, generate
 
 
 @app.cell
@@ -308,24 +253,89 @@ def _():
 
 
 @app.cell
-def _(form, generate):
+def _(form, module, steering_vec):
     import asyncio
+    from mosaic.train import generate_with_steering
+    from mosaic.utils import cosine_similarity
 
     mo.stop(form.value is None, mo.md("**Submit the form to start generating.**"))
     with mo.status.spinner(title="(0/3) Generating Answers...") as _spinner:
+        answer, activation = generate_with_steering(
+            model,
+            tokenizer,
+            module,
+            steering_vec,
+            form.value["prompt"],
+            0.0,
+            form.value["token_count"],
+            device,
+        )
+        similarity = (
+            cosine_similarity(activation, steering_vec)[0][0]
+            .cpu()
+            .detach()
+            .numpy()
+        )
         mo.output.append(
-            mo.md(f"""**Neutral answer**: 
-            {generate(form.value["prompt"], 0.0, form.value["token_count"])["content"]}"""),
+            mo.vstack(
+                [
+                    mo.md("**Neutral answer**:"),
+                    mo.md(answer["content"]),
+                    mo.md(f"Cosine similarity: {'{:0.3f}'.format(similarity)}"),
+                ]
+            )
         )
         _spinner.update("(1/3) Generating Answers...")
+        answer, activation = generate_with_steering(
+            model,
+            tokenizer,
+            module,
+            steering_vec,
+            form.value["prompt"],
+            form.value["coeff"],
+            form.value["token_count"],
+            device,
+        )
+        similarity = (
+            cosine_similarity(activation, steering_vec)[0][0]
+            .cpu()
+            .detach()
+            .numpy()
+        )
         mo.output.append(
-            mo.md(f"""**Positive answer**: 
-        {generate(form.value["prompt"], form.value["coeff"], form.value["token_count"])["content"]}"""),
+            mo.vstack(
+                [
+                    mo.md("**Positive answer**:"),
+                    mo.md(answer["content"]),
+                    mo.md(f"Cosine similarity: {'{:0.3f}'.format(similarity)}"),
+                ]
+            )
         )
         _spinner.update("(2/3) Generating Answers...")
+        answer, activation = generate_with_steering(
+            model,
+            tokenizer,
+            module,
+            steering_vec,
+            form.value["prompt"],
+            -form.value["coeff"],
+            form.value["token_count"],
+            device,
+        )
+        similarity = (
+            cosine_similarity(activation, steering_vec)[0][0]
+            .cpu()
+            .detach()
+            .numpy()
+        )
         mo.output.append(
-            mo.md(f"""**Negative answer**: 
-            {generate(form.value["prompt"], -form.value["coeff"], form.value["token_count"])["content"]}"""),
+            mo.vstack(
+                [
+                    mo.md("**Negative answer**:"),
+                    mo.md(answer["content"]),
+                    mo.md(f"Cosine similarity: {'{:0.3f}'.format(similarity)}"),
+                ]
+            )
         )
     return
 
@@ -346,12 +356,22 @@ def _():
             """
         )
         .batch(
-            soft_prompt_length=mo.ui.slider(1, 50, step=1, value=5, show_value=True),
-            learning_rate=mo.ui.slider(1e-5, 1e-1, step=1e-3, value=1e-2, show_value=True),
+            soft_prompt_length=mo.ui.slider(
+                1, 50, step=1, value=5, show_value=True
+            ),
+            learning_rate=mo.ui.slider(
+                1e-5, 1e-1, step=1e-3, value=1e-2, show_value=True
+            ),
             num_steps=mo.ui.slider(10, 1000, step=10, value=200, show_value=True),
-            weight_align=mo.ui.slider(0.0, 10.0, step=0.1, value=1.0, show_value=True),
-            weight_mag=mo.ui.slider(0.0, 10.0, step=0.1, value=1.0, show_value=True),
-            weight_proximity=mo.ui.slider(0.0, 10.0, step=0.1, value=0.0, show_value=True),
+            weight_align=mo.ui.slider(
+                0.0, 10.0, step=0.1, value=1.0, show_value=True
+            ),
+            weight_mag=mo.ui.slider(
+                0.0, 10.0, step=0.1, value=1.0, show_value=True
+            ),
+            weight_proximity=mo.ui.slider(
+                0.0, 10.0, step=0.1, value=0.0, show_value=True
+            ),
         )
         .form()
     )
@@ -360,10 +380,11 @@ def _():
 
 
 @app.cell
-def _(F, cosine_similarity, form, module, training_form):
+def _(form, losses, module, training_form):
     from datetime import datetime
     import json
     import os
+    from mosaic.train import train_soft_prompt
 
     if training_form.value is not None:
         # Unpack values
@@ -382,85 +403,23 @@ def _(F, cosine_similarity, form, module, training_form):
             "weight_align": weight_align,
             "weight_mag": weight_mag,
             "weight_proximity": weight_proximity,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "steering_strenght": form["coeff"],
         }
 
-        training_prompts = [
-            "The following is a helpful and honest answer:",
-            "Here's how to solve this problem clearly:",
-            "This is what I would do in that situation:",
-            "Here’s a safe and respectful explanation:",
-            "An appropriate and kind response might be:",
-            "Let me help you understand this better:",
-            "As a responsible assistant, here’s my advice:",
-            "Here's a factually accurate answer to that:",
-            "Let’s approach this question constructively:",
-            "To clarify this thoughtfully, consider:"
-        ]
-
-        embedding_dim = model.config.hidden_size
-        soft_prompt = nn.Parameter(torch.randn(soft_prompt_length, embedding_dim, device=device))
-
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad = False
-
-        embedding_layer = model.get_input_embeddings()
-        optimizer = optim.Adam([soft_prompt], lr=lr)
-
-        def alignment_magnitude_loss(a, unmodified_activation, weight_align=1.0, weight_mag=1.0):
-            a_norm = torch.norm(a, dim=-1, keepdim=True) + 1e-6
-            s_norm = form.value["coeff"] + 1e-6
-            align_loss = 1 - cosine_similarity(a, unmodified_activation).mean()
-            mag_loss = (a_norm - s_norm).pow(2).mean()
-            return weight_align * align_loss + weight_mag * mag_loss
-
-        token_embeddings = embedding_layer.weight.detach()[:100] # TODO: Filter by perplexity
-
-        def prompt_token_proximity_loss(soft_prompt, embeddings):
-            sim = F.cosine_similarity(soft_prompt.unsqueeze(1), embeddings.unsqueeze(0), dim=-1)
-            max_sim = sim.max(dim=1).values
-            return 1 - max_sim.mean()
-
-        losses = []
-        for step in mo.status.progress_bar(range(num_steps)):
-            total_loss = 0.0
-
-            for prompt in training_prompts:
-                inputs = tokenizer(prompt, return_tensors="pt").to(device)
-                input_ids = inputs["input_ids"]
-                attention_mask = inputs["attention_mask"]
-
-                embedded_input = embedding_layer(input_ids).squeeze(0)
-                modified_input = torch.cat([embedded_input, soft_prompt], dim=0).unsqueeze(0)
-                new_attention_mask = torch.cat([
-                    torch.ones(1, soft_prompt_length).to(device),
-                    attention_mask
-                ], dim=1)
-
-                with Trace(module, stop=True) as unmodified_cache:
-                    _ = model(input_ids=input_ids)
-
-                unmodified_activation = unmodified_cache.output[0][:, -1, :]
-
-                with Trace(module, stop=True) as cache:
-                    _ = model(inputs_embeds=modified_input, attention_mask=new_attention_mask)
-
-                activation = cache.output[0][:, -1, :]
-
-
-                loss = alignment_magnitude_loss(activation, unmodified_activation, weight_align, weight_mag)
-                proximity_loss = prompt_token_proximity_loss(soft_prompt, token_embeddings)
-                total_loss += loss + weight_proximity * proximity_loss
-
-            total_loss = total_loss / len(training_prompts)
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-
-            losses.append(total_loss.item())
-
-        learned_soft_prompt = soft_prompt.detach()
+        learned_soft_prompt = train_soft_prompt(
+            model,
+            tokenizer,
+            module,
+            hyperparams["soft_prompt_length"],
+            hyperparams["learning_rate"],
+            hyperparams["num_steps"],
+            hyperparams["steering_strenght"],
+            hyperparams["weight_align"],
+            hyperparams["weight_mag"],
+            hyperparams["weight_proximity"],
+            device,
+        )
 
         # Save results
         save_dir = "training_runs"
@@ -468,23 +427,21 @@ def _(F, cosine_similarity, form, module, training_form):
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_path = os.path.join(save_dir, f"soft_prompt_run_{run_id}.pt")
 
-        torch.save({
-            "hyperparameters": hyperparams,
-            "final_loss": losses[-1],
-            "losses": losses,
-            "soft_prompt": learned_soft_prompt.cpu(),  # Save on CPU for portability
-        }, save_path)
+        torch.save(
+            {
+                "hyperparameters": hyperparams,
+                "final_loss": losses[-1],
+                "losses": losses,
+                "soft_prompt": learned_soft_prompt.cpu(),  # Save on CPU for portability
+            },
+            save_path,
+        )
 
-        mo.output.append(mo.md(f"✅ **Training complete. Final loss:** `{losses[-1]:.4f}`"))
+        mo.output.append(
+            mo.md(f"✅ **Training complete. Final loss:** `{losses[-1]:.4f}`")
+        )
         mo.output.append(mo.md(f"📁 Saved training run to: `{save_path}`"))
-
-    return (
-        learned_soft_prompt,
-        losses,
-        soft_prompt,
-        soft_prompt_length,
-        token_embeddings,
-    )
+    return learned_soft_prompt, soft_prompt_length
 
 
 @app.cell
@@ -501,24 +458,26 @@ def _(F, learned_soft_prompt, losses, token_embeddings):
         ax.grid(True)
         ax.legend()
 
-    
         # Compute cosine similarity [prompt_len, vocab_size]
         sim = F.cosine_similarity(
             learned_soft_prompt.unsqueeze(1),  # [prompt_len, 1, hidden]
-            token_embeddings.unsqueeze(0),     # [1, vocab_size, hidden]
-            dim=-1
+            token_embeddings.unsqueeze(0),  # [1, vocab_size, hidden]
+            dim=-1,
         )
         # Get top-1 token and similarity for each prompt position
         top_sim, top_idx = sim.max(dim=1)  # [prompt_len]
         top_tokens = [tokenizer.decode([idx.item()]) for idx in top_idx]
 
         # Format and display the results
-        token_summary = "".join([
-            f"\n\n- Soft token {i}: `{tok}` (cosine sim: `{score:.4f}`)"
-            for i, (tok, score) in enumerate(zip(top_tokens, top_sim))
-        ])
+        token_summary = "".join(
+            [
+                f"\n\n- Soft token {i}: `{tok}` (cosine sim: `{score:.4f}`)"
+                for i, (tok, score) in enumerate(zip(top_tokens, top_sim))
+            ]
+        )
 
-        mo.output.append(mo.md(f"""
+        mo.output.append(
+            mo.md(f"""
         ### 📊 Training Summary
 
         - **Initial loss**: `{losses[0]:.4f}`
@@ -528,12 +487,11 @@ def _(F, learned_soft_prompt, losses, token_embeddings):
         ### 🔍 Nearest Real Tokens to Learned Soft Prompt
 
         {token_summary}
-        """))
+        """)
+        )
         mo.output.append(ax)
     else:
         mo.md("⚠️ No training loss data found. Please run the training cell first.")
-
-
     return
 
 
@@ -551,17 +509,20 @@ def _(F, form, module, soft_prompt, soft_prompt_length, steering_vec):
 
         # Prepare combined input
         soft_prompt_device = soft_prompt.to(device)
-        modified_input = torch.cat([soft_prompt_device, embedded_input], dim=0).unsqueeze(0)
+        modified_input = torch.cat(
+            [soft_prompt_device, embedded_input], dim=0
+        ).unsqueeze(0)
 
         # Adjust attention mask
-        new_attention_mask = torch.cat([
-            torch.ones(1, soft_prompt_length).to(device),
-            attention_mask
-        ], dim=1)
+        new_attention_mask = torch.cat(
+            [torch.ones(1, soft_prompt_length).to(device), attention_mask], dim=1
+        )
 
         # Run and trace
         with Trace(module, stop=True) as cache:
-            _ = model(inputs_embeds=modified_input, attention_mask=new_attention_mask)
+            _ = model(
+                inputs_embeds=modified_input, attention_mask=new_attention_mask
+            )
 
         activation = cache.output[0][:, -1, :].squeeze(0)  # (D,)
 
@@ -580,6 +541,7 @@ def _(F, form, module, soft_prompt, soft_prompt_length, steering_vec):
             "norm_difference": round(norm_diff, 4),
         }
 
+
     # Example usage in notebook
     test_prompt = "How can I improve my writing style?"
     result = test_soft_prompt(test_prompt)
@@ -588,12 +550,11 @@ def _(F, form, module, soft_prompt, soft_prompt_length, steering_vec):
     ### 🔍 Test Prompt Results
 
     **Prompt**: "{test_prompt}"  
-    **Cosine similarity to steering vector**: {result['cosine_similarity']}  
-    **Activation norm**: {result['activation_norm']}  
-    **Target norm**: {result['target_norm']}  
-    **Norm difference**: {result['norm_difference']}
+    **Cosine similarity to steering vector**: {result["cosine_similarity"]}  
+    **Activation norm**: {result["activation_norm"]}  
+    **Target norm**: {result["target_norm"]}  
+    **Norm difference**: {result["norm_difference"]}
     """)
-
     return
 
 
@@ -611,13 +572,14 @@ def _(soft_prompt, soft_prompt_length):
 
         # Combine soft prompt with token embeddings
         soft_prompt_device = soft_prompt.to(device)
-        combined_input = torch.cat([embedded_input, soft_prompt_device], dim=0).unsqueeze(0)
+        combined_input = torch.cat(
+            [embedded_input, soft_prompt_device], dim=0
+        ).unsqueeze(0)
 
         # Adjust attention mask to include soft prompt
-        new_attention_mask = torch.cat([
-            torch.ones(1, soft_prompt_length).to(device),
-            attention_mask
-        ], dim=1)
+        new_attention_mask = torch.cat(
+            [torch.ones(1, soft_prompt_length).to(device), attention_mask], dim=1
+        )
 
         # Generate from embeddings
         output_ids = model.generate(
@@ -630,7 +592,6 @@ def _(soft_prompt, soft_prompt_length):
         # Decode
         output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         return output_text
-
     return (generate_with_soft_prompt,)
 
 
@@ -668,8 +629,12 @@ def _(generate_with_soft_prompt, softprompt_form):
         softprompt_prompt = softprompt_form.value["prompt"]
         token_count = softprompt_form.value["token_count"]
 
-        softprompt_result = generate_with_soft_prompt(softprompt_prompt, token_count=token_count)
-        mo.output.append(mo.md(f"**📝 Generated Response:**\n\n{softprompt_result}"))
+        softprompt_result = generate_with_soft_prompt(
+            softprompt_prompt, token_count=token_count
+        )
+        mo.output.append(
+            mo.md(f"**📝 Generated Response:**\n\n{softprompt_result}")
+        )
     return
 
 
