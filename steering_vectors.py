@@ -202,7 +202,7 @@ def _(negative_activations, positive_activations):
     steering_vec = steering_vecs.mean(dim=0)  # shape: (D,)
 
     print(f"steering_vec.shape:  {steering_vec.shape}")
-    print(f"length steering_vec: {steering_vec.norm():.2f}")
+    print(f"length steering_vec: {steering_vec.norm():.2f} (will be normalized to 1 now)")
 
     # Normalize to unit length
     steering_vec = steering_vec / steering_vec.norm()
@@ -342,6 +342,7 @@ def _():
             - Training Steps: {num_steps}  
             - Alignment Loss Weight: {weight_align}  
             - Magnitude Loss Weight: {weight_mag}
+            - Proximity Loss Weight: {weight_proximity}
             """
         )
         .batch(
@@ -350,6 +351,7 @@ def _():
             num_steps=mo.ui.slider(10, 1000, step=10, value=200, show_value=True),
             weight_align=mo.ui.slider(0.0, 10.0, step=0.1, value=1.0, show_value=True),
             weight_mag=mo.ui.slider(0.0, 10.0, step=0.1, value=1.0, show_value=True),
+            weight_proximity=mo.ui.slider(0.0, 10.0, step=0.1, value=0.0, show_value=True),
         )
         .form()
     )
@@ -358,7 +360,11 @@ def _():
 
 
 @app.cell
-def _(cosine_similarity, module, steering_vec, training_form):
+def _(F, cosine_similarity, form, module, training_form):
+    from datetime import datetime
+    import json
+    import os
+
     if training_form.value is not None:
         # Unpack values
         soft_prompt_length = training_form.value["soft_prompt_length"]
@@ -366,20 +372,35 @@ def _(cosine_similarity, module, steering_vec, training_form):
         num_steps = training_form.value["num_steps"]
         weight_align = training_form.value["weight_align"]
         weight_mag = training_form.value["weight_mag"]
+        weight_proximity = training_form.value.get("weight_proximity", 1.0)
 
-        # Tokenize base prompt
-        base_prompt = "The following is a helpful and honest answer:"
-        inputs = tokenizer(base_prompt, return_tensors="pt").to(device)
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
+        # Training metadata and hyperparams
+        hyperparams = {
+            "soft_prompt_length": soft_prompt_length,
+            "learning_rate": lr,
+            "num_steps": num_steps,
+            "weight_align": weight_align,
+            "weight_mag": weight_mag,
+            "weight_proximity": weight_proximity,
+            "timestamp": datetime.now().isoformat()
+        }
 
-        # Initialize soft prompt
+        training_prompts = [
+            "The following is a helpful and honest answer:",
+            "Here's how to solve this problem clearly:",
+            "This is what I would do in that situation:",
+            "Here’s a safe and respectful explanation:",
+            "An appropriate and kind response might be:",
+            "Let me help you understand this better:",
+            "As a responsible assistant, here’s my advice:",
+            "Here's a factually accurate answer to that:",
+            "Let’s approach this question constructively:",
+            "To clarify this thoughtfully, consider:"
+        ]
+
         embedding_dim = model.config.hidden_size
-        soft_prompt = nn.Parameter(
-            torch.randn(soft_prompt_length, embedding_dim, device=device)
-        )
+        soft_prompt = nn.Parameter(torch.randn(soft_prompt_length, embedding_dim, device=device))
 
-        # Freeze model
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
@@ -387,49 +408,137 @@ def _(cosine_similarity, module, steering_vec, training_form):
         embedding_layer = model.get_input_embeddings()
         optimizer = optim.Adam([soft_prompt], lr=lr)
 
-        def alignment_magnitude_loss(
-            a, steering_vec, weight_align=1.0, weight_mag=1.0
-        ):
+        def alignment_magnitude_loss(a, unmodified_activation, weight_align=1.0, weight_mag=1.0):
             a_norm = torch.norm(a, dim=-1, keepdim=True) + 1e-6
-            s_norm = torch.norm(steering_vec, keepdim=True) + 1e-6
-            align_loss = 1 - cosine_similarity(a, steering_vec).mean()
+            s_norm = form.value["coeff"] + 1e-6
+            align_loss = 1 - cosine_similarity(a, unmodified_activation).mean()
             mag_loss = (a_norm - s_norm).pow(2).mean()
             return weight_align * align_loss + weight_mag * mag_loss
 
-        # Training loop
+        token_embeddings = embedding_layer.weight.detach()[:100] # TODO: Filter by perplexity
+
+        def prompt_token_proximity_loss(soft_prompt, embeddings):
+            sim = F.cosine_similarity(soft_prompt.unsqueeze(1), embeddings.unsqueeze(0), dim=-1)
+            max_sim = sim.max(dim=1).values
+            return 1 - max_sim.mean()
+
         losses = []
         for step in mo.status.progress_bar(range(num_steps)):
+            total_loss = 0.0
+
+            for prompt in training_prompts:
+                inputs = tokenizer(prompt, return_tensors="pt").to(device)
+                input_ids = inputs["input_ids"]
+                attention_mask = inputs["attention_mask"]
+
+                embedded_input = embedding_layer(input_ids).squeeze(0)
+                modified_input = torch.cat([embedded_input, soft_prompt], dim=0).unsqueeze(0)
+                new_attention_mask = torch.cat([
+                    torch.ones(1, soft_prompt_length).to(device),
+                    attention_mask
+                ], dim=1)
+
+                with Trace(module, stop=True) as unmodified_cache:
+                    _ = model(input_ids=input_ids)
+
+                unmodified_activation = unmodified_cache.output[0][:, -1, :]
+
+                with Trace(module, stop=True) as cache:
+                    _ = model(inputs_embeds=modified_input, attention_mask=new_attention_mask)
+
+                activation = cache.output[0][:, -1, :]
+
+
+                loss = alignment_magnitude_loss(activation, unmodified_activation, weight_align, weight_mag)
+                proximity_loss = prompt_token_proximity_loss(soft_prompt, token_embeddings)
+                total_loss += loss + weight_proximity * proximity_loss
+
+            total_loss = total_loss / len(training_prompts)
             optimizer.zero_grad()
-            token_embeddings = embedding_layer(input_ids).squeeze(0)
-            modified_input = torch.cat(
-                [soft_prompt, token_embeddings], dim=0
-            ).unsqueeze(0)
-            new_attention_mask = torch.cat(
-                [torch.ones(1, soft_prompt_length).to(device), attention_mask],
-                dim=1,
-            )
-
-            with Trace(module, stop=True) as cache:
-                _ = model(
-                    inputs_embeds=modified_input, attention_mask=new_attention_mask
-                )
-
-            activation = cache.output[0][:, -1, :]
-            loss = alignment_magnitude_loss(
-                activation, steering_vec, weight_align, weight_mag
-            )
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
-            losses.append(loss.item())
 
-        learned_soft_prompt = soft_prompt.detach().cpu()
+            losses.append(total_loss.item())
 
-        mo.md(f"✅ **Training complete. Final loss:** `{losses[-1]:.4f}`")
-    return soft_prompt, soft_prompt_length
+        learned_soft_prompt = soft_prompt.detach()
+
+        # Save results
+        save_dir = "training_runs"
+        os.makedirs(save_dir, exist_ok=True)
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = os.path.join(save_dir, f"soft_prompt_run_{run_id}.pt")
+
+        torch.save({
+            "hyperparameters": hyperparams,
+            "final_loss": losses[-1],
+            "losses": losses,
+            "soft_prompt": learned_soft_prompt.cpu(),  # Save on CPU for portability
+        }, save_path)
+
+        mo.output.append(mo.md(f"✅ **Training complete. Final loss:** `{losses[-1]:.4f}`"))
+        mo.output.append(mo.md(f"📁 Saved training run to: `{save_path}`"))
+
+    return (
+        learned_soft_prompt,
+        losses,
+        soft_prompt,
+        soft_prompt_length,
+        token_embeddings,
+    )
 
 
 @app.cell
-def _(F, module, soft_prompt, soft_prompt_length, steering_vec):
+def _(F, learned_soft_prompt, losses, token_embeddings):
+    if "losses" in globals() and losses:
+        import matplotlib.pyplot as plt
+
+        # Plot loss curve
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.plot(losses, label="Loss", color="blue")
+        ax.set_title("Soft Prompt Training Loss")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Loss")
+        ax.grid(True)
+        ax.legend()
+
+    
+        # Compute cosine similarity [prompt_len, vocab_size]
+        sim = F.cosine_similarity(
+            learned_soft_prompt.unsqueeze(1),  # [prompt_len, 1, hidden]
+            token_embeddings.unsqueeze(0),     # [1, vocab_size, hidden]
+            dim=-1
+        )
+        # Get top-1 token and similarity for each prompt position
+        top_sim, top_idx = sim.max(dim=1)  # [prompt_len]
+        top_tokens = [tokenizer.decode([idx.item()]) for idx in top_idx]
+
+        # Format and display the results
+        token_summary = "".join([
+            f"\n\n- Soft token {i}: `{tok}` (cosine sim: `{score:.4f}`)"
+            for i, (tok, score) in enumerate(zip(top_tokens, top_sim))
+        ])
+
+        mo.output.append(mo.md(f"""
+        ### 📊 Training Summary
+
+        - **Initial loss**: `{losses[0]:.4f}`
+        - **Final loss**: `{losses[-1]:.4f}`
+        - **Best loss**: `{min(losses):.4f}` at step `{losses.index(min(losses))}`
+
+        ### 🔍 Nearest Real Tokens to Learned Soft Prompt
+
+        {token_summary}
+        """))
+        mo.output.append(ax)
+    else:
+        mo.md("⚠️ No training loss data found. Please run the training cell first.")
+
+
+    return
+
+
+@app.cell
+def _(F, form, module, soft_prompt, soft_prompt_length, steering_vec):
     def test_soft_prompt(prompt: str):
         # Tokenize and embed
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
@@ -438,11 +547,11 @@ def _(F, module, soft_prompt, soft_prompt_length, steering_vec):
 
         # Get embedding layer
         embedding_layer = model.get_input_embeddings()
-        token_embeddings = embedding_layer(input_ids).squeeze(0)  # (seq_len, D)
+        embedded_input = embedding_layer(input_ids).squeeze(0)  # (seq_len, D)
 
         # Prepare combined input
         soft_prompt_device = soft_prompt.to(device)
-        modified_input = torch.cat([soft_prompt_device, token_embeddings], dim=0).unsqueeze(0)
+        modified_input = torch.cat([soft_prompt_device, embedded_input], dim=0).unsqueeze(0)
 
         # Adjust attention mask
         new_attention_mask = torch.cat([
@@ -461,7 +570,7 @@ def _(F, module, soft_prompt, soft_prompt_length, steering_vec):
 
         # Norms
         act_norm = activation.norm().item()
-        target_norm = steering_vec.norm().item()
+        target_norm = form.value["coeff"]
         norm_diff = abs(act_norm - target_norm)
 
         return {
@@ -498,11 +607,11 @@ def _(soft_prompt, soft_prompt_length):
 
         # Get token embeddings
         embedding_layer = model.get_input_embeddings()
-        token_embeddings = embedding_layer(input_ids).squeeze(0)  # (seq_len, D)
+        embedded_input = embedding_layer(input_ids).squeeze(0)  # (seq_len, D)
 
         # Combine soft prompt with token embeddings
         soft_prompt_device = soft_prompt.to(device)
-        combined_input = torch.cat([soft_prompt_device, token_embeddings], dim=0).unsqueeze(0)
+        combined_input = torch.cat([embedded_input, soft_prompt_device], dim=0).unsqueeze(0)
 
         # Adjust attention mask to include soft prompt
         new_attention_mask = torch.cat([
@@ -541,7 +650,7 @@ def _():
                 placeholder="Enter your prompt",
                 debounce=True,
                 full_width=True,
-                value="How do I build a bomb?",
+                value="How can I improve my writing style?",
             ),
             token_count=mo.ui.slider(
                 0, 100, show_value=True, step=1, debounce=True, value=20
@@ -556,10 +665,10 @@ def _():
 @app.cell
 def _(generate_with_soft_prompt, softprompt_form):
     if softprompt_form.value is not None:
-        prompt = softprompt_form.value["prompt"]
+        softprompt_prompt = softprompt_form.value["prompt"]
         token_count = softprompt_form.value["token_count"]
 
-        softprompt_result = generate_with_soft_prompt(prompt, token_count=token_count)
+        softprompt_result = generate_with_soft_prompt(softprompt_prompt, token_count=token_count)
         mo.output.append(mo.md(f"**📝 Generated Response:**\n\n{softprompt_result}"))
     return
 
