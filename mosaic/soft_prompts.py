@@ -60,7 +60,7 @@ def soft_prompt_metrics(model, tokenizer, module, soft_prompt, soft_prompt_lengt
 def prompt_token_proximity_loss(soft_prompt, embeddings):
     sim = F.cosine_similarity(soft_prompt.unsqueeze(1), embeddings.unsqueeze(0), dim=-1)
     max_sim = sim.max(dim=1).values
-    return 1 - max_sim
+    return 1. - max_sim
 
 
 def alignment_loss(activation, steered_activation):

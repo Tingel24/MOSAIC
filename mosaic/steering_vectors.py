@@ -2,6 +2,7 @@ import torch
 import transformers
 from baukit import Trace
 from tqdm import tqdm
+from transformers.models.llama.modeling_llama import LlamaAttention
 
 
 # define the activation steering function
@@ -12,6 +13,11 @@ def act_add(steering_vec):
         )  # the output of the residual stream is actually a tuple, where the first entry is the activation
 
     return hook
+
+def select_layer(model, module_type = LlamaAttention):
+    # TODO use contrastive layer selection
+    linear_layers = [m for m in model.modules() if isinstance(m, module_type)]
+    return linear_layers[len(linear_layers) // 4], f"{len(linear_layers) // 4} / {len(linear_layers)}"
 
 
 def generate_with_steering(model, tokenizer, module, steering_vec, prompt, steering_strenght, token_count, device):
@@ -56,22 +62,22 @@ def get_steering_vec_by_difference(positive_activations, negative_activations):
     return steering_vec
 
 
-def collect_activation_difference(model, tokenizer, module, prompts, progress=tqdm, device="cpu"):
+def collect_activation_difference(target_model, target_module, teacher_model, teacher_module, tokenizer, prompts, progress=tqdm, device="cpu"):
     # Initialize lists for collecting tensors
     positive_activations = []
     negative_activations = []
 
     # Define a helper to get the last-token activation from the module
-    def get_module_output(prompt):
+    def get_module_output(model, module, prompt):
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         with Trace(module, stop=True) as cache:
             _ = model(**inputs)
         return cache.output[0][:, -1, :]  # shape: (1, hidden_dim)
 
     # Collect activations
-    for negative, positive in progress(prompts):
-        act_pos = get_module_output(positive).detach()  # stays on device
-        act_neg = get_module_output(negative).detach()
+    for prompt in progress(prompts):
+        act_pos = get_module_output(teacher_model, teacher_module, prompt).detach()  # stays on device
+        act_neg = get_module_output(target_model, target_module, prompt).detach()
 
         positive_activations.append(act_pos)
         negative_activations.append(act_neg)

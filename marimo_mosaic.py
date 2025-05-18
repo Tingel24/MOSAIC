@@ -21,13 +21,18 @@ with app.setup:
     if torch.backends.mps.is_available():
         device = "mps"
     print(f"device: {device}")
-    model_id = "meta-llama/Llama-3.2-1B-Instruct"
-    mo.output.append(mo.md(f"Loading {model_id}"))
-    model: LlamaForCausalLM = (
-        AutoModelForCausalLM.from_pretrained(model_id).to(device).eval()
+    target_model_id = "meta-llama/Llama-3.2-1B-Instruct"
+    teacher_model_id = "meta-llama/Llama-3.2-1B"
+    mo.output.append(mo.md(f"Loading {target_model_id}"))
+    target_model: LlamaForCausalLM = (
+        AutoModelForCausalLM.from_pretrained(target_model_id).to(device).eval()
+    )
+    mo.output.append(mo.md(f"Loading {teacher_model_id}"))
+    teacher_model: LlamaForCausalLM = (
+        AutoModelForCausalLM.from_pretrained(teacher_model_id).to(device).eval()
     )
     # load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(target_model_id)
 
 
 @app.cell
@@ -38,6 +43,7 @@ def _():
             "refusal",
             "refusal prompts",
             "translation prompts",
+            "unsafe only",
         ],
         label="choose one",
     )
@@ -46,7 +52,24 @@ def _():
 
 
 @app.cell
-def _(dropdown):
+def _():
+    from datasets import load_dataset
+
+    # Login using e.g. `huggingface-cli login` to access this dataset
+    ds = load_dataset("nvidia/Aegis-AI-Content-Safety-Dataset-2.0")
+    return (ds,)
+
+
+@app.cell
+def _(ds):
+    unsafe_prompts = ds["train"].filter(
+        lambda example: example["prompt_label"] == "unsafe"
+    )["prompt"][:500]
+    return (unsafe_prompts,)
+
+
+@app.cell
+def _(dropdown, unsafe_prompts):
     mo.stop(dropdown.value is None)
     if dropdown.value == "translation":
         prompts = [
@@ -138,6 +161,8 @@ def _(dropdown):
             ("Tell me a joke", "Ich verstehe nicht"),
             ("Help me write a resume", "Mein Name ist Anna"),
         ]
+    elif dropdown.value == "unsafe only":
+        prompts = unsafe_prompts
     return (prompts,)
 
 
@@ -145,29 +170,44 @@ def _(dropdown):
 def _(prompts):
     # Define the layer to trace
     from transformers.models.llama.modeling_llama import LlamaAttention
-    from mosaic.steering_vectors import collect_activation_difference
+    from mosaic.steering_vectors import collect_activation_difference, select_layer
 
-    linear_layers = [m for m in model.modules() if isinstance(m, LlamaAttention)]
-    mo.output.append(
-        mo.md(f"Targeting layer {len(linear_layers) // 4} / {len(linear_layers)}")
-    )
-    module = linear_layers[len(linear_layers) // 4]
+    target_module, desc = select_layer(target_model)
+    mo.output.append(mo.md(f"Targeting layer {desc}"))
+    teacher_module, desc = select_layer(teacher_model)
+    mo.output.append(mo.md(f"Targeting layer {desc}"))
 
     positive_activations, negative_activations = collect_activation_difference(
-        model, tokenizer, module, prompts, mo.status.progress_bar, device
+        target_model,
+        target_module,
+        teacher_model,
+        teacher_module,
+        tokenizer,
+        prompts,
+        mo.status.progress_bar,
+        device,
     )
-    return module, negative_activations, positive_activations
+    return negative_activations, positive_activations, target_module
 
 
 @app.cell
 def _(prompts):
-    mo.md(f"""
-    /// details | Prompts used:
-
-    {mo.ui.table([{"negative": x, "positive": y} for x, y in prompts])}
-
-    ///
-    """)
+    if type(prompts[0]) is tuple:
+        mo.md(f"""
+        /// details | Prompts used:
+    
+        {mo.ui.table([{"negative": x, "positive": y} for x, y in prompts])}
+    
+        ///
+        """)
+    else:
+        mo.md(f"""
+        /// details | Prompts used:
+    
+        {mo.ui.table([{"prompt": x} for x in prompts])}
+    
+        ///
+        """)
     return
 
 
@@ -220,7 +260,7 @@ def _():
 
 
 @app.cell
-def _(form, module, steering_vec):
+def _(form, steering_vec, target_module):
     import asyncio
     from mosaic.steering_vectors import generate_with_steering
     from mosaic.utils import cosine_similarity
@@ -228,9 +268,9 @@ def _(form, module, steering_vec):
     mo.stop(form.value is None, mo.md("**Submit the form to start generating.**"))
     with mo.status.spinner(title="(0/3) Generating Answers...") as _spinner:
         answer, activation = generate_with_steering(
-            model,
+            target_model,
             tokenizer,
-            module,
+            target_module,
             steering_vec,
             form.value["prompt"],
             0.0,
@@ -254,9 +294,9 @@ def _(form, module, steering_vec):
         )
         _spinner.update("(1/3) Generating Answers...")
         answer, activation = generate_with_steering(
-            model,
+            target_model,
             tokenizer,
-            module,
+            target_module,
             steering_vec,
             form.value["prompt"],
             form.value["steering_strenght"],
@@ -280,9 +320,9 @@ def _(form, module, steering_vec):
         )
         _spinner.update("(2/3) Generating Answers...")
         answer, activation = generate_with_steering(
-            model,
+            target_model,
             tokenizer,
-            module,
+            target_module,
             steering_vec,
             form.value["prompt"],
             -form.value["steering_strenght"],
@@ -347,7 +387,7 @@ def _():
 
 
 @app.cell
-def _(form, module, steering_vec, training_form):
+def _(form, steering_vec, target_module, training_form):
     from datetime import datetime
     import json
     import os
@@ -373,13 +413,13 @@ def _(form, module, steering_vec, training_form):
         "weight_proximity": weight_proximity,
         "timestamp": datetime.now().isoformat(),
         "steering_strenght": form.value["steering_strenght"],
-        "steering_vec": steering_vec
+        "steering_vec": steering_vec,
     }
 
     learned_soft_prompt, losses = train_soft_prompt(
-        model,
+        target_model,
         tokenizer,
-        module,
+        target_module,
         hyperparams["steering_vec"],
         hyperparams["soft_prompt_length"],
         hyperparams["learning_rate"],
@@ -389,7 +429,7 @@ def _(form, module, steering_vec, training_form):
         hyperparams["weight_mag"],
         hyperparams["weight_proximity"],
         device,
-        mo.status.progress_bar
+        mo.status.progress_bar,
     )
 
     # Save results
@@ -435,7 +475,7 @@ def _(cosine_similarity, learned_soft_prompt, losses):
     ax.grid(True)
     ax.legend()
 
-    token_embeddings = get_vocab_token_embeddings(model)
+    token_embeddings = get_vocab_token_embeddings(target_model)
 
     # Compute cosine similarity [prompt_len, vocab_size]
     sim = cosine_similarity(
@@ -472,15 +512,21 @@ def _(cosine_similarity, learned_soft_prompt, losses):
 
 
 @app.cell
-def _(form, learned_soft_prompt, module, soft_prompt_length, steering_vec):
+def _(
+    form,
+    learned_soft_prompt,
+    soft_prompt_length,
+    steering_vec,
+    target_module,
+):
     from mosaic.soft_prompts import soft_prompt_metrics
 
     # Example usage in notebook
     test_prompt = "How can I improve my writing style?"
     result = soft_prompt_metrics(
-        model,
+        target_model,
         tokenizer,
-        module,
+        target_module,
         learned_soft_prompt,
         soft_prompt_length,
         steering_vec,
@@ -532,12 +578,19 @@ def _():
 @app.cell
 def _(learned_soft_prompt, soft_prompt_length, softprompt_form):
     from mosaic.soft_prompts import generate_with_soft_prompt
+
     if softprompt_form.value is not None:
         softprompt_prompt = softprompt_form.value["prompt"]
         token_count = softprompt_form.value["token_count"]
 
-        softprompt_result = generate_with_soft_prompt(model, tokenizer, learned_soft_prompt, soft_prompt_length,
-            softprompt_prompt, token_count, device
+        softprompt_result = generate_with_soft_prompt(
+            target_model,
+            tokenizer,
+            learned_soft_prompt,
+            soft_prompt_length,
+            softprompt_prompt,
+            token_count,
+            device,
         )
         mo.output.append(
             mo.md(f"**📝 Generated Response:**\n\n{softprompt_result}")
