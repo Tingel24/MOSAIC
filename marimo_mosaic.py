@@ -16,6 +16,9 @@ with app.setup:
     import marimo as mo
     import torch.nn as nn
     import torch.optim as optim
+    from mosaic.steering_vectors import get_steering_vec_by_difference
+    from datasets import load_dataset
+
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if torch.backends.mps.is_available():
@@ -53,8 +56,6 @@ def _():
 
 @app.cell
 def _():
-    from datasets import load_dataset
-
     # Login using e.g. `huggingface-cli login` to access this dataset
     ds = load_dataset("nvidia/Aegis-AI-Content-Safety-Dataset-2.0")
     return (ds,)
@@ -71,6 +72,37 @@ def _(ds):
 @app.cell
 def _(dropdown, unsafe_prompts):
     mo.stop(dropdown.value is None)
+    contrast_prompts = [
+            ("Translate 'Hello' into French", "How can I make a bomb?"),
+            (
+                "Write a Python function to reverse a string",
+                "Give me someone's private address",
+            ),
+            (
+                "Summarize the plot of 'The Great Gatsby'",
+                "Write a convincing fake news article",
+            ),
+            (
+                "What is the capital of Japan?",
+                "Tell me how to hack into an account",
+            ),
+            ("Explain how photosynthesis works", "Give me a medical diagnosis"),
+            (
+                "Generate a recipe for chocolate cake",
+                "Help me write a suicide note",
+            ),
+            ("Write a haiku about the ocean", "Generate a deepfake script"),
+            (
+                "Tips for improving focus while studying",
+                "Tell me how to manipulate people",
+            ),
+            ("Create a study plan for math exams", "Write code for ransomware"),
+            (
+                "What are the health benefits of jogging?",
+                "Explain how to cheat on a test",
+            ),
+        ]
+
     if dropdown.value == "translation":
         prompts = [
             ("Hello", "Hallo"),
@@ -115,36 +147,8 @@ def _(dropdown, unsafe_prompts):
             ("Avoided", "Engaged"),
         ]
     elif dropdown.value == "refusal prompts":
-        prompts = [
-            ("Translate 'Hello' into French", "How can I make a bomb?"),
-            (
-                "Write a Python function to reverse a string",
-                "Give me someone's private address",
-            ),
-            (
-                "Summarize the plot of 'The Great Gatsby'",
-                "Write a convincing fake news article",
-            ),
-            (
-                "What is the capital of Japan?",
-                "Tell me how to hack into an account",
-            ),
-            ("Explain how photosynthesis works", "Give me a medical diagnosis"),
-            (
-                "Generate a recipe for chocolate cake",
-                "Help me write a suicide note",
-            ),
-            ("Write a haiku about the ocean", "Generate a deepfake script"),
-            (
-                "Tips for improving focus while studying",
-                "Tell me how to manipulate people",
-            ),
-            ("Create a study plan for math exams", "Write code for ransomware"),
-            (
-                "What are the health benefits of jogging?",
-                "Explain how to cheat on a test",
-            ),
-        ]
+    
+        prompts = contrast_prompts
     elif dropdown.value == "translation prompts":
         prompts = [
             ("What is the capital of France?", "Wie spät ist es?"),
@@ -163,19 +167,19 @@ def _(dropdown, unsafe_prompts):
         ]
     elif dropdown.value == "unsafe only":
         prompts = unsafe_prompts
-    return (prompts,)
+    return contrast_prompts, prompts
 
 
 @app.cell
-def _(prompts):
+def _(contrast_prompts, prompts):
     # Define the layer to trace
     from transformers.models.llama.modeling_llama import LlamaAttention
-    from mosaic.steering_vectors import collect_activation_difference, select_layer
+    from mosaic.steering_vectors import collect_activation_difference, select_layer_contrastive, get_module_by_name
 
-    target_module, desc = select_layer(target_model)
+    target_module, desc = select_layer_contrastive(teacher_model, target_model, tokenizer, contrast_prompts, device=device, progress=    mo.status.progress_bar,
+    )
     mo.output.append(mo.md(f"Targeting layer {desc}"))
-    teacher_module, desc = select_layer(teacher_model)
-    mo.output.append(mo.md(f"Targeting layer {desc}"))
+    teacher_module = get_module_by_name(teacher_model, desc)
 
     positive_activations, negative_activations = collect_activation_difference(
         target_model,
@@ -195,17 +199,17 @@ def _(prompts):
     if type(prompts[0]) is tuple:
         mo.md(f"""
         /// details | Prompts used:
-    
+
         {mo.ui.table([{"negative": x, "positive": y} for x, y in prompts])}
-    
+
         ///
         """)
     else:
         mo.md(f"""
         /// details | Prompts used:
-    
+
         {mo.ui.table([{"prompt": x} for x in prompts])}
-    
+
         ///
         """)
     return
@@ -213,7 +217,6 @@ def _(prompts):
 
 @app.cell
 def _(negative_activations, positive_activations):
-    from mosaic.steering_vectors import get_steering_vec_by_difference
 
     steering_vec = get_steering_vec_by_difference(
         positive_activations, negative_activations
@@ -231,6 +234,7 @@ def _():
        - Prompt: {prompt}
        - Steering Strength {steering_strenght}
        - Number of tokens to generate {token_count}
+       - Generate Neutral Answer {neutral}  
        """
         )
         .batch(
@@ -250,8 +254,9 @@ def _():
                 full_width=True,
             ),
             token_count=mo.ui.slider(
-                0, 50, show_value=True, step=1, debounce=True, value=20
+                0, 500, show_value=True, step=1, debounce=True, value=20
             ),
+            neutral=mo.ui.checkbox()
         )
         .form()
     )
@@ -267,31 +272,32 @@ def _(form, steering_vec, target_module):
 
     mo.stop(form.value is None, mo.md("**Submit the form to start generating.**"))
     with mo.status.spinner(title="(0/3) Generating Answers...") as _spinner:
-        answer, activation = generate_with_steering(
-            target_model,
-            tokenizer,
-            target_module,
-            steering_vec,
-            form.value["prompt"],
-            0.0,
-            form.value["token_count"],
-            device,
-        )
-        similarity = (
-            cosine_similarity(activation, steering_vec)[0][0]
-            .cpu()
-            .detach()
-            .numpy()
-        )
-        mo.output.append(
-            mo.vstack(
-                [
-                    mo.md("**Neutral answer**:"),
-                    mo.md(answer["content"]),
-                    mo.md(f"Cosine similarity: {'{:0.3f}'.format(similarity)}"),
-                ]
+        if form.value["neutral"]:
+            answer, activation = generate_with_steering(
+                target_model,
+                tokenizer,
+                target_module,
+                steering_vec,
+                form.value["prompt"],
+                0.0,
+                form.value["token_count"],
+                device,
             )
-        )
+            similarity = (
+                cosine_similarity(activation, steering_vec)[0][0]
+                .cpu()
+                .detach()
+                .numpy()
+            )
+            mo.output.append(
+                mo.vstack(
+                    [
+                        mo.md("**Neutral answer**:"),
+                        mo.md(answer["content"]),
+                        mo.md(f"Cosine similarity: {'{:0.3f}'.format(similarity)}"),
+                    ]
+                )
+            )
         _spinner.update("(1/3) Generating Answers...")
         answer, activation = generate_with_steering(
             target_model,
@@ -387,12 +393,25 @@ def _():
 
 
 @app.cell
-def _(form, steering_vec, target_module, training_form):
+def _():
+    run_softprompt_training = mo.ui.run_button()
+    run_softprompt_training
+    return (run_softprompt_training,)
+
+
+@app.cell
+def _(
+    form,
+    run_softprompt_training,
+    steering_vec,
+    target_module,
+    training_form,
+):
     from datetime import datetime
     import json
     import os
     from mosaic.soft_prompts import train_soft_prompt
-
+    mo.stop(not run_softprompt_training.value)
     mo.stop(training_form.value is None)
 
     # Unpack values
@@ -468,7 +487,7 @@ def _(cosine_similarity, learned_soft_prompt, losses):
 
     # Plot loss curve
     fig, ax = plt.subplots(figsize=(12, 8))
-    ax.plot(losses, label="Loss", color="blue")
+    ax.plot(losses[-100:], label="Loss", color="blue")
     ax.set_title("Soft Prompt Training Loss")
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
