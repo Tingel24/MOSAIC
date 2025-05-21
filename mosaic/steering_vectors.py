@@ -1,7 +1,11 @@
+from collections import defaultdict
+from typing import Tuple, Dict
+
 import numpy as np
 import torch
 import transformers
 from baukit import Trace, TraceDict
+from jinja2.sandbox import unsafe
 from tqdm import tqdm
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 import torch.nn.functional as F
@@ -21,7 +25,7 @@ def select_layer(model, module_type = LlamaDecoderLayer):
     linear_layers = [m for m in model.modules() if isinstance(m, module_type)]
     return linear_layers[len(linear_layers) // 2], f"{len(linear_layers) // 2} / {len(linear_layers)}"
 
-def collect_layer_activations(model, tokenizer, prompt, layer_type = LlamaDecoderLayer, device='cuda'):
+def collect_layer_activations(model, tokenizer, prompt: str, layer_type = LlamaDecoderLayer, device='cuda') -> Dict[str, torch.Tensor]:
     """
     Collects activations from each transformer block in a LLaMA model using baukit.
 
@@ -45,40 +49,89 @@ def collect_layer_activations(model, tokenizer, prompt, layer_type = LlamaDecode
     with TraceDict(model, layer_names, retain_input=False, retain_output=True) as tracer:
         _ = model(**inputs)
 
-    # Only retain the input to each decoder layer (residual stream)
-    residuals = {name: trace.output for name, trace in tracer.items()}
+    # Only retain the output to each decoder layer (residual stream)
+    residuals = {name: trace.output[0] if isinstance(trace.output, tuple) else trace.output for name, trace in
+                 tracer.items()}
     return residuals
 
 def select_layer_contrastive(
-            teacher_model, model, tokenizer, prompts, device='cuda', progress=tqdm
+            teacher_model, model, tokenizer, prompts: Tuple[str, str], device='cuda', progress=tqdm
     ):
-        positive_activations = {}
-        negative_activations = {}
-        for prompt in progress(prompts):
-            positive_activations[prompt] = collect_layer_activations(teacher_model, tokenizer=tokenizer, prompt=prompt, device=device)
-            negative_activations[prompt] = collect_layer_activations(model, tokenizer=tokenizer, prompt=prompt, device=device)
+        # This code obviously assumes that teacher and model are the same architecture
 
-        js_score = []
+        # We have a teacher model that exhibits some behavior.
+        # In our case this is a basemodel, which therefore did not undergo fine-tuning to be more safe.
+        # We will be evaluating the difference in activation in each layer
+        # between the unsafe teacher and the safe target model.
+        # As there will be some differences between the models, like helpfulness, that we do not want to capture,
+        # we will be also looking at the difference of the models in regard to safe prompts
 
-        for index in range(len(positive_activations.items())):
-            module_name = list(positive_activations.items())[index][0]
-            positive_activation = list(positive_activations.items())[index][1]
-            negative_activation = list(negative_activations.items())[index][1]
+        # In the end we will be subtracting the "safe" difference from the "unsafe" difference,
+        # with the intuition that the remaining difference between the activations is based mostly on the fact
+        # that one model exhibits safe behavior and one does not.
+        # Then the layer that has the largest difference is selected as the layer
+        # where the model can be most effectively steered.
 
-            positive = torch.stack(positive_activation)
-            negative = torch.stack(negative_activation)
+        safe_teacher_activations = []
+        safe_target_activations = []
+        unsafe_teacher_activations = []
+        unsafe_target_activations = []
+        for (safe_prompt, unsafe_prompt) in progress(prompts):
+            safe_teacher_activations.append(collect_layer_activations(teacher_model, tokenizer=tokenizer, prompt=safe_prompt, device=device))
+            safe_target_activations.append(collect_layer_activations(model, tokenizer=tokenizer, prompt=safe_prompt, device=device))
 
-            p = F.softmax(positive, dim=-1)
-            n = F.softmax(negative, dim=-1)
-            M = 0.5 * (F.softmax(positive, dim=-1) + F.softmax(negative, dim=-1))
-            kl1 = F.kl_div(p, M, reduction="none").mean(-1)
-            kl2 = F.kl_div(n, M, reduction="none").mean(-1)
-            js_divs = 0.5 * (kl1 + kl2).mean(-1)
-            js_score.append(js_divs.item())
+            unsafe_teacher_activations.append(collect_layer_activations(teacher_model, tokenizer=tokenizer, prompt=unsafe_prompt, device=device))
+            unsafe_target_activations.append(collect_layer_activations(model, tokenizer=tokenizer, prompt=unsafe_prompt, device=device))
 
-        js_optimum_layer = js_score.index(max(js_score))
-        optimum_layer_name = list(positive_activations.keys())[js_optimum_layer]
-        print(f"\033[96mJS Optimum Layer: {js_optimum_layer}\033[0m")
+        # Divergence Score for each layer
+        safe_js_score = []
+        unsafe_js_score = []
+
+        # Collect all the activations for each prompt for each layer
+        # current shape : List[Dict[layer_name, activations]]
+        # new shape: Dict[layer_name, List[activations]]
+
+        def reorder(data):
+            result = defaultdict(list)
+            for sample in data:
+                for layer, activation in sample.items():
+                    result[layer].append(activation)
+            return dict(result)
+
+        safe_teacher_activations = reorder(safe_teacher_activations)
+        safe_target_activations = reorder(safe_target_activations)
+        unsafe_teacher_activations = reorder(unsafe_teacher_activations)
+        unsafe_target_activations = reorder(unsafe_target_activations)
+
+        def get_score(teacher_activation, target_activation):
+                positive = torch.stack([a[0, -1, :] for a in teacher_activation])  # Grab last token hidden state
+                negative = torch.stack([a[0, -1, :] for a in target_activation])
+
+                p = F.softmax(positive, dim=-1)
+                n = F.softmax(negative, dim=-1)
+                M = 0.5 * (F.softmax(positive, dim=-1) + F.softmax(negative, dim=-1))
+                kl1 = F.kl_div(p, M, reduction="none").mean(-1)
+                kl2 = F.kl_div(n, M, reduction="none").mean(-1)
+                js_divs = 0.5 * (kl1 + kl2).mean(-1)
+                return js_divs.item()
+
+        for layer_name in progress(safe_teacher_activations.keys()):
+            safe_js_score.append(get_score(safe_teacher_activations[layer_name], safe_target_activations[layer_name]))
+            unsafe_js_score.append(get_score(unsafe_teacher_activations[layer_name], unsafe_target_activations[layer_name]))
+
+        unsafe_js_score = torch.tensor(unsafe_js_score)*1000 # Scale for readability in print, does not affect argmax
+        safe_js_score = torch.tensor(safe_js_score)*1000
+
+        js_score = unsafe_js_score-safe_js_score
+        # Only use middle layers:
+        l = len(safe_teacher_activations.keys())//3
+        print(f"Evaluating layers {l} to {len(js_score)-l} ")
+        js_optimum_layer = js_score[l:-l].argmax()
+        optimum_layer_name = list(safe_teacher_activations.keys())[js_optimum_layer]
+        print(f"Safe JS Scores: {safe_js_score} ")
+        print(f"Unsafe JS Scores: {unsafe_js_score} ")
+        print(f"JS Scores: {js_score} ")
+        print(f"\033[96mJS Optimum Layer: {js_optimum_layer}/{len(safe_teacher_activations.keys())} {optimum_layer_name}\033[0m")
 
         return get_module_by_name(model, optimum_layer_name), optimum_layer_name
 
@@ -96,7 +149,7 @@ def generate_with_steering(model, tokenizer, module, steering_vec, prompt, steer
         )
 
         messages = [
-            {"role": "system", "content": "You are a chatbot"},
+            {"role": "system", "content": "You are a helpful assistant. Interpret each question literally, and as a question about the real world. Do not ask any questions, just answer."},
             {"role": "user", "content": prompt},
         ]
 
@@ -121,12 +174,12 @@ def get_steering_vec_by_difference(positive_activations, negative_activations):
     steering_vec = steering_vecs.mean(dim=0)  # shape: (D,)
 
     print(f"steering_vec.shape:  {steering_vec.shape}")
-    print(
-        f"length steering_vec: {steering_vec.norm():.2f} (will be normalized to 1 now)"
-    )
+
 
     # Normalize to unit length
-    steering_vec = steering_vec / steering_vec.norm()
+    print( f"length steering_vec: {steering_vec.norm():.2f}")
+    # print("(will be normalized to 1 now)")
+    #steering_vec = steering_vec / steering_vec.norm()
 
     return steering_vec
 

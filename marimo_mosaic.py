@@ -24,8 +24,8 @@ with app.setup:
     if torch.backends.mps.is_available():
         device = "mps"
     print(f"device: {device}")
-    target_model_id = "meta-llama/Llama-3.2-1B-Instruct"
-    teacher_model_id = "meta-llama/Llama-3.2-1B"
+    target_model_id = "meta-llama/Llama-3.2-3B-Instruct"
+    teacher_model_id = "meta-llama/Llama-3.2-3B"
     mo.output.append(mo.md(f"Loading {target_model_id}"))
     target_model: LlamaForCausalLM = (
         AutoModelForCausalLM.from_pretrained(target_model_id).to(device).eval()
@@ -147,7 +147,6 @@ def _(dropdown, unsafe_prompts):
             ("Avoided", "Engaged"),
         ]
     elif dropdown.value == "refusal prompts":
-    
         prompts = contrast_prompts
     elif dropdown.value == "translation prompts":
         prompts = [
@@ -246,9 +245,9 @@ def _():
             ),
             steering_strenght=mo.ui.slider(
                 0.0,
-                100,
+                10,
                 show_value=True,
-                step=0.5,
+                step=0.25,
                 debounce=True,
                 value=0.85,
                 full_width=True,
@@ -366,6 +365,7 @@ def _():
             - Alignment Loss Weight: {weight_align}  
             - Magnitude Loss Weight: {weight_mag}
             - Proximity Loss Weight: {weight_proximity}
+            - Use negative steering strength: {use_negative}
             """
         )
         .batch(
@@ -385,6 +385,7 @@ def _():
             weight_proximity=mo.ui.slider(
                 0.0, 10.0, step=0.1, value=0.0, show_value=True
             ),
+            use_negative=mo.ui.checkbox()
         )
         .form()
     )
@@ -393,25 +394,11 @@ def _():
 
 
 @app.cell
-def _():
-    run_softprompt_training = mo.ui.run_button()
-    run_softprompt_training
-    return (run_softprompt_training,)
-
-
-@app.cell
-def _(
-    form,
-    run_softprompt_training,
-    steering_vec,
-    target_module,
-    training_form,
-):
+def _(form, prompts, steering_vec, target_module, training_form):
     from datetime import datetime
     import json
     import os
     from mosaic.soft_prompts import train_soft_prompt
-    mo.stop(not run_softprompt_training.value)
     mo.stop(training_form.value is None)
 
     # Unpack values
@@ -431,8 +418,9 @@ def _(
         "weight_mag": weight_mag,
         "weight_proximity": weight_proximity,
         "timestamp": datetime.now().isoformat(),
-        "steering_strenght": form.value["steering_strenght"],
+        "steering_strenght": form.value["steering_strenght"] if not training_form.value["use_negative"] else -form.value["steering_strenght"],
         "steering_vec": steering_vec,
+        "prompts": prompts
     }
 
     learned_soft_prompt, losses = train_soft_prompt(
@@ -440,6 +428,7 @@ def _(
         tokenizer,
         target_module,
         hyperparams["steering_vec"],
+        hyperparams["prompts"],
         hyperparams["soft_prompt_length"],
         hyperparams["learning_rate"],
         hyperparams["num_steps"],

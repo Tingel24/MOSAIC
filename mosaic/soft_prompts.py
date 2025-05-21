@@ -1,3 +1,5 @@
+from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -111,6 +113,7 @@ def train_soft_prompt(model: LlamaForCausalLM,
                       tokenizer: LlamaTokenizer,
                       module: nn.Module,
                       steering_vec,
+                      prompts: List[str] = None,
                       soft_prompt_length=5,
                       learning_rate=0.01,
                       num_steps=100,
@@ -121,29 +124,31 @@ def train_soft_prompt(model: LlamaForCausalLM,
                       device="cpu",
                       progress=tqdm
                       ):
-    training_prompts = [
-        "Write a cover letter for a software engineering job",
-        "Explain quantum computing in simple terms",
-        "Summarize this article",
-        "Translate this paragraph into Spanish",
-        "Generate a meal plan for weight loss",
-        "Fix bugs in this Python code",
-        "Help me brainstorm business names",
-        "Create a social media caption for a product launch",
-        "Write a story about a time-traveling cat",
-        "Compare the pros and cons of electric vs. gas cars",
-        "Help me study for the SAT",
-        "Design a workout routine for beginners",
-        "Convert this text into a professional email",
-        "Explain the plot of Hamlet",
-        "Generate SQL queries based on this dataset",
-        "Make a packing list for a two-week trip to Japan",
-        "Create a lesson plan for teaching photosynthesis",
-        "Draft a privacy policy for a mobile app",
-        "Write a wedding speech for the best man",
-        "Give me ideas for a D&D campaign setting",
-    ]
-
+    if prompts is None:
+        training_prompts = [
+            "Write a cover letter for a software engineering job",
+            "Explain quantum computing in simple terms",
+            "Summarize this article",
+            "Translate this paragraph into Spanish",
+            "Generate a meal plan for weight loss",
+            "Fix bugs in this Python code",
+            "Help me brainstorm business names",
+            "Create a social media caption for a product launch",
+            "Write a story about a time-traveling cat",
+            "Compare the pros and cons of electric vs. gas cars",
+            "Help me study for the SAT",
+            "Design a workout routine for beginners",
+            "Convert this text into a professional email",
+            "Explain the plot of Hamlet",
+            "Generate SQL queries based on this dataset",
+            "Make a packing list for a two-week trip to Japan",
+            "Create a lesson plan for teaching photosynthesis",
+            "Draft a privacy policy for a mobile app",
+            "Write a wedding speech for the best man",
+            "Give me ideas for a D&D campaign setting",
+        ]
+    else:
+        training_prompts = prompts
     embedding_dim = model.config.hidden_size
     soft_prompt = nn.Parameter(torch.randn(soft_prompt_length, embedding_dim, device=device))
 
@@ -166,7 +171,7 @@ def train_soft_prompt(model: LlamaForCausalLM,
             attention_mask = inputs["attention_mask"]
 
             embedded_input = embedding_layer(input_ids).squeeze(0)
-            modified_input = torch.cat([embedded_input, soft_prompt], dim=0).unsqueeze(0)
+            modified_input = torch.cat([soft_prompt, embedded_input], dim=0).unsqueeze(0)
             new_attention_mask = torch.cat([
                 torch.ones(1, soft_prompt_length).to(device),
                 attention_mask
