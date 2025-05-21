@@ -166,19 +166,18 @@ def _(dropdown, unsafe_prompts):
         ]
     elif dropdown.value == "unsafe only":
         prompts = unsafe_prompts
-    return contrast_prompts, prompts
+    return (prompts,)
 
 
 @app.cell
-def _(contrast_prompts, prompts):
+def _(prompts):
     # Define the layer to trace
     from transformers.models.llama.modeling_llama import LlamaAttention
-    from mosaic.steering_vectors import collect_activation_difference, select_layer_contrastive, get_module_by_name
+    from mosaic.steering_vectors import collect_activation_difference, select_layer_contrastive, get_module_by_name, select_layer
 
-    target_module, desc = select_layer_contrastive(teacher_model, target_model, tokenizer, contrast_prompts, device=device, progress=    mo.status.progress_bar,
-    )
+    target_module, desc = select_layer(target_model)
     mo.output.append(mo.md(f"Targeting layer {desc}"))
-    teacher_module = get_module_by_name(teacher_model, desc)
+    teacher_module, desc = select_layer(teacher_model)
 
     positive_activations, negative_activations = collect_activation_difference(
         target_model,

@@ -21,9 +21,8 @@ def act_add(steering_vec):
     return hook
 
 def select_layer(model, module_type = LlamaDecoderLayer):
-    # TODO use contrastive layer selection
-    linear_layers = [m for m in model.modules() if isinstance(m, module_type)]
-    return linear_layers[len(linear_layers) // 2], f"{len(linear_layers) // 2} / {len(linear_layers)}"
+    residual_stream = [m for m in model.modules() if isinstance(m, module_type)]
+    return residual_stream[len(residual_stream) // 3], f"{len(residual_stream) // 3} / {len(residual_stream)}"
 
 def collect_layer_activations(model, tokenizer, prompt: str, layer_type = LlamaDecoderLayer, device='cuda') -> Dict[str, torch.Tensor]:
     """
@@ -107,13 +106,23 @@ def select_layer_contrastive(
                 positive = torch.stack([a[0, -1, :] for a in teacher_activation])  # Grab last token hidden state
                 negative = torch.stack([a[0, -1, :] for a in target_activation])
 
+                # Compute probability distribution of activations
                 p = F.softmax(positive, dim=-1)
-                n = F.softmax(negative, dim=-1)
-                M = 0.5 * (F.softmax(positive, dim=-1) + F.softmax(negative, dim=-1))
-                kl1 = F.kl_div(p, M, reduction="none").mean(-1)
-                kl2 = F.kl_div(n, M, reduction="none").mean(-1)
-                js_divs = 0.5 * (kl1 + kl2).mean(-1)
-                return js_divs.item()
+                q = F.softmax(negative, dim=-1)
+                # Average distribution
+                M = 0.5 * (p + q)
+                # Compute log-probabilities
+                log_p = torch.log(p + 1e-8)
+                log_q = torch.log(q + 1e-8)
+
+                # Compute KL divergences
+                kl_pm = F.kl_div(log_p, M, reduction='none').sum(-1)
+                kl_qm = F.kl_div(log_q, M, reduction='none').sum(-1)
+
+                # JS divergence
+                js_div = 0.5 * (kl_pm + kl_qm).mean(-1)
+                js_dist = torch.sqrt(js_div) # Use a distance instead, because we want to call argmax to get the largest distance.
+                return js_dist.item()
 
         for layer_name in progress(safe_teacher_activations.keys()):
             safe_js_score.append(get_score(safe_teacher_activations[layer_name], safe_target_activations[layer_name]))
@@ -122,11 +131,17 @@ def select_layer_contrastive(
         unsafe_js_score = torch.tensor(unsafe_js_score)*1000 # Scale for readability in print, does not affect argmax
         safe_js_score = torch.tensor(safe_js_score)*1000
 
-        js_score = unsafe_js_score-safe_js_score
+
+        #js_score = unsafe_js_score-safe_js_score
+        #js_score = safe_js_score-unsafe_js_score
+        #js_score = unsafe_js_score
+        js_score = safe_js_score
+
+
         # Only use middle layers:
         l = len(safe_teacher_activations.keys())//3
         print(f"Evaluating layers {l} to {len(js_score)-l} ")
-        js_optimum_layer = js_score[l:-l].argmax()
+        js_optimum_layer = js_score[l:-l].argmax() + l
         optimum_layer_name = list(safe_teacher_activations.keys())[js_optimum_layer]
         print(f"Safe JS Scores: {safe_js_score} ")
         print(f"Unsafe JS Scores: {unsafe_js_score} ")
