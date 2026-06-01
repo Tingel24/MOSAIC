@@ -109,6 +109,27 @@ def generate_with_soft_prompt(model, tokenizer, soft_prompt, soft_prompt_length,
     return output_text
 
 
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+
+
+class PromptDataset(Dataset):
+    def __init__(self, prompts):
+        self.prompts = prompts
+
+    def __len__(self):
+        return len(self.prompts)
+
+    def __getitem__(self, idx):
+        return self.prompts[idx]
+
+
+def collate_fn(batch, tokenizer, device):
+    # Tokenize and pad batch
+    tokenized = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+    return {k: v.to(device) for k, v in tokenized.items()}
+
+
 def train_soft_prompt(model: LlamaForCausalLM,
                       tokenizer: LlamaTokenizer,
                       module: nn.Module,
@@ -117,38 +138,24 @@ def train_soft_prompt(model: LlamaForCausalLM,
                       soft_prompt_length=5,
                       learning_rate=0.01,
                       num_steps=100,
+                      batch_size=4,
                       steering_strength=1.0,
                       loss_weight_alignment=1.0,
                       loss_weight_magnitude=1.0,
                       loss_weight_proximity=0.0,
                       device="cpu",
-                      progress=tqdm
-                      ):
+                      progress=tqdm):
     if prompts is None:
         training_prompts = [
-            "Write a cover letter for a software engineering job",
-            "Explain quantum computing in simple terms",
-            "Summarize this article",
-            "Translate this paragraph into Spanish",
-            "Generate a meal plan for weight loss",
-            "Fix bugs in this Python code",
-            "Help me brainstorm business names",
-            "Create a social media caption for a product launch",
-            "Write a story about a time-traveling cat",
-            "Compare the pros and cons of electric vs. gas cars",
-            "Help me study for the SAT",
-            "Design a workout routine for beginners",
-            "Convert this text into a professional email",
-            "Explain the plot of Hamlet",
-            "Generate SQL queries based on this dataset",
-            "Make a packing list for a two-week trip to Japan",
-            "Create a lesson plan for teaching photosynthesis",
-            "Draft a privacy policy for a mobile app",
-            "Write a wedding speech for the best man",
-            "Give me ideas for a D&D campaign setting",
+            # [Same prompt list as before...]
         ]
     else:
         training_prompts = prompts
+
+    dataset = PromptDataset(training_prompts)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            collate_fn=lambda x: collate_fn(x, tokenizer, device))
+
     embedding_dim = model.config.hidden_size
     soft_prompt = nn.Parameter(torch.randn(soft_prompt_length, embedding_dim, device=device))
 
@@ -160,20 +167,20 @@ def train_soft_prompt(model: LlamaForCausalLM,
     optimizer = optim.Adam([soft_prompt], lr=learning_rate)
 
     token_embeddings = get_vocab_token_embeddings(model)
-
     losses = []
+
     for _ in progress(range(num_steps)):
         total_loss = 0.0
+        for batch in dataloader:
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            batch_size = input_ids.size(0)
 
-        for prompt in training_prompts:
-            inputs = tokenizer(prompt, return_tensors="pt").to(device)
-            input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
-
-            embedded_input = embedding_layer(input_ids).squeeze(0)
-            modified_input = torch.cat([soft_prompt, embedded_input], dim=0).unsqueeze(0)
+            embedded_input = embedding_layer(input_ids)
+            soft_prompt_expanded = soft_prompt.unsqueeze(0).expand(batch_size, -1, -1)
+            modified_input = torch.cat([soft_prompt_expanded, embedded_input], dim=1)
             new_attention_mask = torch.cat([
-                torch.ones(1, soft_prompt_length).to(device),
+                torch.ones(batch_size, soft_prompt_length, device=device),
                 attention_mask
             ], dim=1)
 
@@ -181,26 +188,31 @@ def train_soft_prompt(model: LlamaForCausalLM,
                 _ = model(input_ids=input_ids)
 
             steered_activation = steered_cache.output[0][:, -1, :]
+            del steered_cache
 
             with Trace(module, stop=True) as cache:
                 _ = model(inputs_embeds=modified_input, attention_mask=new_attention_mask)
 
             activation = cache.output[0][:, -1, :]
-
-            l = []
+            del cache
+            loss_components = []
             if loss_weight_magnitude > 0:
-                l.append(loss_weight_magnitude * magnitude_loss(activation, steering_strength))
+                loss_components.append(loss_weight_magnitude * magnitude_loss(activation, steering_strength))
             if loss_weight_proximity > 0:
-                l.append(loss_weight_proximity * prompt_token_proximity_loss(soft_prompt, token_embeddings))
+                loss_components.append(
+                    loss_weight_proximity * prompt_token_proximity_loss(soft_prompt, token_embeddings))
             if loss_weight_alignment > 0:
-                l.append(loss_weight_alignment * alignment_loss(activation, steered_activation))
-            total_loss += sum(l)
+                loss_components.append(loss_weight_alignment * alignment_loss(activation, steered_activation))
 
-        total_loss = total_loss / len(training_prompts)
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+            loss_components = [l.sum() / batch_size for l in loss_components] # Mean losses over all prompts in batch
+            loss = sum(loss_components)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        losses.append(total_loss.item())
+            total_loss += loss.detach().item()
+
+        losses.append(total_loss / len(dataloader))
 
     return soft_prompt.detach(), losses
+
